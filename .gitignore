@@ -1,0 +1,31 @@
+# .NET / C# gitignore
+[Bb]in/
+[Oo]bj/
+[Oo]ut/
+[Pp]ublish/
+[Tt]est[Rr]esult*/
+[Bb]uild[Ll]og.*
+
+# Visual Studio / Rider / VS Code
+.vs/
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.user
+*.suo
+*.userprefs
+
+# Build / publish artifacts
+*.dll
+*.exe
+*.pdb
+*.cache
+
+# NuGet
+*.nupkg
+*.snupkg
+artifacts/
+
+# OS
+.DS_Store
+Thumbs.db
