@@ -85,15 +85,36 @@ public static class CredentialStore
 
     public static void SaveRawKey(string apiKey)
     {
+        var key = apiKey.Trim();
+        if (string.IsNullOrWhiteSpace(key)) throw new ArgumentException("API key is empty.", nameof(apiKey));
         Directory.CreateDirectory(ConfigDir);
-        File.WriteAllText(RawKeyPath, apiKey.Trim() + "\n");
-        try
+        // Refuse to follow/replace a symlink: an attacker-writable link could redirect the secret.
+        if (new FileInfo(RawKeyPath).LinkTarget is not null)
+            throw new InvalidOperationException($"Refusing to write key: {RawKeyPath} is a symlink.");
+        if (!OperatingSystem.IsWindows())
         {
-            File.SetUnixFileMode(RawKeyPath, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+            // Create with restrictive mode from the outset (no umask race).
+            var options = new FileStreamOptions
+            {
+                Mode = FileMode.Create,
+                Access = FileAccess.Write,
+                Share = FileShare.None,
+                UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite,
+            };
+            using (var fs = new FileStream(RawKeyPath, options))
+            {
+                var bytes = System.Text.Encoding.UTF8.GetBytes(key + "\n");
+                fs.Write(bytes, 0, bytes.Length);
+                fs.Flush(flushToDisk: true);
+            }
+            var mode = File.GetUnixFileMode(RawKeyPath);
+            if ((mode & (UnixFileMode.GroupRead | UnixFileMode.GroupWrite | UnixFileMode.OtherRead | UnixFileMode.OtherWrite)) != 0)
+                throw new InvalidOperationException($"Could not secure {RawKeyPath} (mode {mode}); refusing to leave a readable key file.");
         }
-        catch
+        else
         {
-            // Best effort on non-Unix platforms.
+            // Windows: user profile dir is private by default; fail loudly if we cannot write.
+            File.WriteAllText(RawKeyPath, key + "\n");
         }
     }
 

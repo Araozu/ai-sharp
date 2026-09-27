@@ -47,8 +47,9 @@ internal static class Program
               ai-sharp serve [--port 5111]                 Start HTTP+SSE host (loopback only by default)
               ai-sharp chat -m "prompt" [--session ID] [--model ID] [--no-stream]
               ai-sharp sessions create [--title T] | list | show ID
-              ai-sharp models                                List provider models (GET /models)
-              ai-sharp key save <API_KEY> | status           Store/inspect credential location (never prints key)
+              ai-sharp models                                List provider models (GET /models; protocol annotated)
+              ai-sharp key save [-]                          Save key from hidden prompt, stdin (-) or KEY arg (arg stays in shell history)
+              ai-sharp key status                            Show credential location (never prints key)
 
             Config (non-secret): OPENCODE_GO_BASE_URL, OPENCODE_GO_MODEL, AI_SHARP_DATA_DIR, AI_SHARP_PORT
             Secret: OPENCODE_GO_API_KEY (env) or ~/.config/ai-sharp/opencode-go.key (chmod 600)
@@ -69,7 +70,11 @@ internal static class Program
             Directory.CreateDirectory(Path.Combine(dataDir, "sessions"));
         }
         var cfg = AiSharpConfig.Default(dataDir);
-        return (cfg, new FileSessionStore(dataDir));
+        var store = new FileSessionStore(dataDir);
+        var reconciled = store.ReconcileInterruptedRuns();
+        if (reconciled > 0)
+            Console.Error.WriteLine($"reconciled {reconciled} interrupted run(s) to failed (previous process ended mid-run).");
+        return (cfg, store);
     }
 
     private static OpencodeGoProvider BootProvider(AiSharpConfig cfg)
@@ -92,6 +97,17 @@ internal static class Program
         return 0;
     }
 
+    private static string? TakeValue(string[] args, ref int i, string option)
+    {
+        if (i + 1 >= args.Length)
+        {
+            Console.Error.WriteLine($"Missing value for {option}.");
+            return null;
+        }
+        i++;
+        return args[i];
+    }
+
     private static async Task<int> ChatAsync(string[] args)
     {
         string? message = null, sessionId = null, model = null;
@@ -101,10 +117,11 @@ internal static class Program
             switch (args[i])
             {
                 case "-m":
-                case "--message": message = args[++i]; break;
-                case "--session": sessionId = args[++i]; break;
-                case "--model": model = args[++i]; break;
+                case "--message": message = TakeValue(args, ref i, args[i]); if (message is null) return 1; break;
+                case "--session": sessionId = TakeValue(args, ref i, args[i]); if (sessionId is null) return 1; break;
+                case "--model": model = TakeValue(args, ref i, args[i]); if (model is null) return 1; break;
                 case "--no-stream": noStream = true; break;
+                default: Console.Error.WriteLine($"Unknown option: {args[i]}"); return 1;
             }
         }
         if (string.IsNullOrWhiteSpace(message))
@@ -158,7 +175,14 @@ internal static class Program
             {
                 string? title = null;
                 for (var i = 1; i < args.Length; i++)
-                    if (args[i] == "--title" && i + 1 < args.Length) title = args[++i];
+                {
+                    if (args[i] == "--title")
+                    {
+                        title = TakeValue(args, ref i, "--title");
+                        if (title is null) return 1;
+                    }
+                    else { Console.Error.WriteLine($"Unknown option: {args[i]}"); return 1; }
+                }
                 var s = store.Create(title);
                 Console.WriteLine(s.Id);
                 return 0;
@@ -192,13 +216,17 @@ internal static class Program
         var provider = BootProvider(cfg);
         var models = await provider.ListModelsAsync();
         foreach (var m in models.OrderBy(x => x))
-            Console.WriteLine((m == cfg.Model ? "* " : "  ") + m);
+        {
+            var proto = OpencodeGoProvider.ProtocolFor(m);
+            var tag = proto == "responses" ? "responses" : $"{proto} (needs Phase 4 adapter)";
+            Console.WriteLine($"{(m == cfg.Model ? "* " : "  ")}{m}  [{tag}]");
+        }
         return 0;
     }
 
     private static int KeyCmd(string[] args)
     {
-        if (args.Length == 0) { Console.Error.WriteLine("Usage: ai-sharp key save <KEY> | status"); return 1; }
+        if (args.Length == 0) { Console.Error.WriteLine("Usage: ai-sharp key save [-] | status"); return 1; }
         if (args[0] == "status")
         {
             Console.WriteLine($"configDir: {CredentialStore.ConfigDir}");
@@ -206,14 +234,35 @@ internal static class Program
             Console.WriteLine($"env {CredentialStore.EnvPrimary}: {(string.IsNullOrEmpty(Environment.GetEnvironmentVariable(CredentialStore.EnvPrimary)) ? "missing" : "set (redacted)")}");
             return 0;
         }
-        if (args[0] == "save" && args.Length >= 2)
+        if (args[0] == "save")
         {
-            CredentialStore.SaveRawKey(args[1]);
+            string? key = args.Length >= 2 ? args[1] : null;
+            if (key == "-") key = Console.In.ReadToEnd().Trim();
+            else if (key is null) key = ReadHidden("Enter OpenCode Go API key: ");
+            else Console.Error.WriteLine("warning: passing the key as an argument stores it in shell history; prefer `ai-sharp key save` (prompt) or `-` (stdin).");
+            if (string.IsNullOrWhiteSpace(key)) { Console.Error.WriteLine("Empty key; not saved."); return 1; }
+            CredentialStore.SaveRawKey(key);
             Console.WriteLine($"saved to {CredentialStore.RawKeyPath} (chmod 600)");
             return 0;
         }
-        Console.Error.WriteLine("Usage: ai-sharp key save <KEY> | status");
+        Console.Error.WriteLine("Usage: ai-sharp key save [-] | status");
         return 1;
+    }
+
+    private static string ReadHidden(string prompt)
+    {
+        Console.Error.Write(prompt);
+        if (Console.IsInputRedirected) return Console.In.ReadLine()?.Trim() ?? "";
+        var sb = new System.Text.StringBuilder();
+        while (true)
+        {
+            var k = Console.ReadKey(intercept: true);
+            if (k.Key == ConsoleKey.Enter) break;
+            if (k.Key == ConsoleKey.Backspace && sb.Length > 0) sb.Length--;
+            else if (!char.IsControl(k.KeyChar)) sb.Append(k.KeyChar);
+        }
+        Console.Error.WriteLine();
+        return sb.ToString().Trim();
     }
 
     private static void PrintUsage(ProviderUsage? u)

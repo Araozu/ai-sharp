@@ -29,6 +29,50 @@ public sealed class OpencodeGoProvider : IChatProvider
         SupportsVision: false, // text-only in Phase 1
         MaxOutputChars: 64_000);
 
+    /// <summary>Idle timeout for the SSE body read. HttpClient.Timeout bounds the whole request.</summary>
+    private static readonly TimeSpan StreamIdleTimeout = TimeSpan.FromSeconds(120);
+
+    // Phase 1 speaks only the Responses protocol (/responses). Go serves other
+    // models over /chat/completions or /messages (see https://opencode.ai/docs/go/#endpoints);
+    // those need a second adapter (Phase 4), so reject them early with guidance.
+    private static readonly HashSet<string> ChatCompletionsModels = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "glm-5.3-flash", "glm-5.3", "glm-5.2", "glm-5.1",
+        "kimi-k3", "kimi-k2.7-code", "kimi-k2.6",
+        "longcat-2.0", "longcat-2.5-preview-free",
+        "deepseek-v4.1-flash", "deepseek-v4-pro", "deepseek-v4-flash", "deepseek-v4-flash-vision-exp", "deepseek-flash",
+        "mimo-v2.6-flash", "mimo-v2.6-pro", "mimo-v2.5", "mimo-v2.5-pro",
+        "hy4-preview", "hy3", "space-bunny-free", "big-pickle",
+    };
+
+    private static readonly HashSet<string> MessagesModels = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "minimax-m3", "minimax-m2.7", "minimax-m2.5",
+        "qwen3.8-max", "qwen3.8-flash", "qwen3.7-max", "qwen3.7-plus", "qwen3.6-plus", "qwen3.5-plus",
+    };
+
+    /// <summary>Which Go protocol a model id uses, per the Go endpoint table. Unknown ids return "unknown".</summary>
+    public static string ProtocolFor(string modelId)
+    {
+        if (ChatCompletionsModels.Contains(modelId)) return "chat-completions";
+        if (MessagesModels.Contains(modelId)) return "messages";
+        return "responses"; // known Responses models + unknown future ids attempt /responses
+    }
+
+    private static void EnsureResponsesCompatible(string model)
+    {
+        if (ChatCompletionsModels.Contains(model))
+            throw new ProviderException(ProviderErrorCodes.BadRequest,
+                $"Model '{model}' is served over /chat/completions, which this Phase 1 adapter does not speak (Responses API only). " +
+                "Use a Responses model (e.g. muse-spark-1.3-contributor); other protocols arrive with the second adapter (Phase 4).",
+                false);
+        if (MessagesModels.Contains(model))
+            throw new ProviderException(ProviderErrorCodes.BadRequest,
+                $"Model '{model}' is served over /messages, which this Phase 1 adapter does not speak (Responses API only). " +
+                "Use a Responses model (e.g. muse-spark-1.3-contributor); other protocols arrive with the second adapter (Phase 4).",
+                false);
+    }
+
     public OpencodeGoProvider(HttpClient http, OpencodeGoOptions options)
     {
         _http = http ?? throw new ArgumentNullException(nameof(http));
@@ -98,6 +142,7 @@ public sealed class OpencodeGoProvider : IChatProvider
         // Use the request's CancellationToken (transport-neutral contract).
         var ct = request.CancellationToken;
         var model = string.IsNullOrWhiteSpace(request.Model) ? _options.Model : request.Model;
+        EnsureResponsesCompatible(model);
 
         var payload = new ResponsesRequest(
             Model: model,
@@ -137,6 +182,7 @@ public sealed class OpencodeGoProvider : IChatProvider
             ProviderUsage? finalUsage = null;
             string? responseId = null;
             string? completedText = null;
+            var gotTerminal = false;
 
             await foreach (var (eventName, data) in ReadSseAsync(res, ct).ConfigureAwait(false))
             {
@@ -163,16 +209,20 @@ public sealed class OpencodeGoProvider : IChatProvider
                         case "response.output_text.delta":
                         {
                             var delta = root.TryGetProperty("delta", out var d) ? d.GetString() ?? "" : "";
-                            if (delta.Length > 0)
+                            if (delta.Length > 0 && fullText.Length < Capabilities.MaxOutputChars)
                             {
-                                fullText.Append(delta);
-                                if (fullText.Length <= Capabilities.MaxOutputChars + 4096)
-                                    pendingDelta = delta;
+                                // Cap accumulation before appending: over-limit output is dropped,
+                                // not buffered, while usage/completion events are still consumed.
+                                var room = Capabilities.MaxOutputChars - fullText.Length;
+                                var chunk = delta.Length <= room ? delta : delta[..room];
+                                fullText.Append(chunk);
+                                pendingDelta = chunk;
                             }
                             break;
                         }
                         case "response.completed":
                         {
+                            gotTerminal = true;
                             if (root.TryGetProperty("response", out var r))
                             {
                                 responseId = r.TryGetProperty("id", out var id) ? id.GetString() : responseId;
@@ -184,6 +234,11 @@ public sealed class OpencodeGoProvider : IChatProvider
                                     Usage = null,
                                 });
                             }
+                            break;
+                        }
+                        case "response.incomplete":
+                        {
+                            pendingError = ExtractSseError(root) ?? "Response incomplete (truncated or length-capped).";
                             break;
                         }
                         case "response.failed":
@@ -209,6 +264,11 @@ public sealed class OpencodeGoProvider : IChatProvider
                     yield return new TextDeltaEvent(pendingDelta);
             }
 
+            // A stream that ends without response.completed is truncated, not successful.
+            if (!gotTerminal)
+                throw new ProviderException(ProviderErrorCodes.Server,
+                    "Stream ended before response.completed arrived; the answer may be partial and was NOT persisted as completed.",
+                    true);
             var text = fullText.Length > 0 ? fullText.ToString() : (completedText ?? "");
             if (text.Length > Capabilities.MaxOutputChars)
                 text = text[..Capabilities.MaxOutputChars];
@@ -264,10 +324,19 @@ public sealed class OpencodeGoProvider : IChatProvider
         using var reader = new StreamReader(stream);
         string? currentEvent = null;
         var dataBuf = new StringBuilder();
-        while (!reader.EndOfStream)
+        while (true)
         {
-            ct.ThrowIfCancellationRequested();
-            var line = await reader.ReadLineAsync(ct).ConfigureAwait(false);
+            string? line;
+            try
+            {
+                // Idle timeout so a stalled body cannot block cancellation/shutdown forever.
+                line = await reader.ReadLineAsync(ct).AsTask().WaitAsync(StreamIdleTimeout, ct).ConfigureAwait(false);
+            }
+            catch (TimeoutException ex)
+            {
+                throw new ProviderException(ProviderErrorCodes.Timeout,
+                    $"Provider stream stalled for {StreamIdleTimeout.TotalSeconds:n0}s with no data.", true, null, ex);
+            }
             if (line is null) break;
             if (line.Length == 0)
             {
@@ -317,6 +386,24 @@ public sealed class OpencodeGoProvider : IChatProvider
 
     private static string? ExtractSseError(JsonElement root)
     {
+        // response.failed frames carry the error nested under response.error.
+        if (root.TryGetProperty("response", out var resp) && resp.ValueKind == JsonValueKind.Object)
+        {
+            if (resp.TryGetProperty("error", out var nested))
+            {
+                var detail = nested.ValueKind == JsonValueKind.String ? nested.GetString() : nested.GetRawText();
+                string? code = null;
+                if (nested.ValueKind == JsonValueKind.Object)
+                {
+                    if (nested.TryGetProperty("code", out var c)) code = c.GetString();
+                    if (nested.TryGetProperty("message", out var m)) detail = m.GetString() ?? detail;
+                }
+                var status = resp.TryGetProperty("status", out var st) ? st.GetString() : null;
+                return code is not null ? $"{code}: {detail} (status={status ?? "failed"})" : detail;
+            }
+            if (resp.TryGetProperty("status", out var onlyStatus) && onlyStatus.GetString() is string s && s != "completed")
+                return $"Response status {s}.";
+        }
         if (root.TryGetProperty("error", out var e))
         {
             if (e.ValueKind == JsonValueKind.String) return e.GetString();

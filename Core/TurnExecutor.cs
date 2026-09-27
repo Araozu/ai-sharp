@@ -1,16 +1,22 @@
 using AiSharp.Core;
 
+using System.Collections.Concurrent;
+
 namespace AiSharp.Core;
 
 /// <summary>
 /// Smallest turn executor for Phase 1: user prompt -> provider stream -> persisted assistant message.
 /// No tools yet (Phase 2). Bounds output size; cancellation yields a cancelled run.
+/// One turn per session at a time: an in-process semaphore plus a cross-process lock file
+/// serialize competing turns so concurrent runs cannot swap prompts/history.
 /// </summary>
 public sealed class TurnExecutor
 {
     private readonly ISessionStore _store;
     private readonly IChatProvider _provider;
     private readonly string _defaultModel;
+    private static readonly ConcurrentDictionary<string, SemaphoreSlim> Gates = new();
+    private static readonly TimeSpan LockTimeout = TimeSpan.FromSeconds(60);
 
     public TurnExecutor(ISessionStore store, IChatProvider provider, string defaultModel)
     {
@@ -27,15 +33,42 @@ public sealed class TurnExecutor
 
     /// <summary>
     /// Execute one turn. onDelta receives live text deltas (for SSE/CLI streaming).
+    /// onRunStarted fires right after the run row is created, so transports can
+    /// correlate start/delta/completion events with the durable run id.
     /// </summary>
     public async Task<TurnResult> ExecuteAsync(
         string sessionId,
         string prompt,
         string? modelOverride = null,
         Func<string, Task>? onDelta = null,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        Func<StoredRun, Task>? onRunStarted = null)
     {
         if (string.IsNullOrWhiteSpace(prompt)) throw new ArgumentException("Prompt is empty.", nameof(prompt));
+        FileSessionStore.ValidateSessionId(sessionId);
+        var gate = Gates.GetOrAdd(sessionId, _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            return await ExecuteLockedAsync(sessionId, prompt, modelOverride, onDelta, ct, onRunStarted).ConfigureAwait(false);
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+
+    private async Task<TurnResult> ExecuteLockedAsync(
+        string sessionId,
+        string prompt,
+        string? modelOverride,
+        Func<string, Task>? onDelta,
+        CancellationToken ct,
+        Func<StoredRun, Task>? onRunStarted)
+    {
+        // Cross-process mutual exclusion for the whole turn (see SessionLockFile).
+        var sessionsDir = _store is FileSessionStore fs ? fs.SessionsDir : Path.Combine(_store.DataDir, "sessions");
+        using var _ = SessionLockFile.Acquire(sessionsDir, sessionId, LockTimeout, ct);
         var session = _store.Get(sessionId);
         var model = string.IsNullOrWhiteSpace(modelOverride) ? _defaultModel : modelOverride!;
 
@@ -47,6 +80,7 @@ public sealed class TurnExecutor
         var history = session.Messages.Select(m => new ChatMessage(m.Role, m.Text)).ToList();
 
         var run = _store.CreateRun(sessionId, prompt);
+        if (onRunStarted is not null) await onRunStarted(run).ConfigureAwait(false);
         var sb = new System.Text.StringBuilder();
         ProviderUsage? usage = null;
         string? providerResponseId = null;

@@ -25,8 +25,13 @@ public static class HttpHost
         });
         builder.Logging.ClearProviders();
         builder.Logging.AddSimpleConsole(o => { o.TimestampFormat = "HH:mm:ss "; });
-        // Bind loopback only unless explicitly overridden (security baseline).
+        // Security baseline (SCOPE §MVP.7): loopback only. Remote binding needs an
+        // explicit auth design (Phase 3), so refuse non-loopback outright for now.
         var bindHost = Environment.GetEnvironmentVariable("AI_SHARP_BIND") ?? "127.0.0.1";
+        if (bindHost is not ("127.0.0.1" or "::1" or "localhost"))
+            throw new InvalidOperationException(
+                $"Refusing to bind {bindHost}: ai-sharp has no authentication yet and serves session transcripts. " +
+                "Bind loopback only (127.0.0.1/::1/localhost) until the Phase 3 auth policy lands.");
         builder.WebHost.UseUrls($"http://{bindHost}:{port}");
 
         var app = builder.Build();
@@ -37,6 +42,7 @@ public static class HttpHost
             status = "ok",
             provider = provider.ProviderId,
             model = config.Model,
+            protocols = new[] { "responses" },
             streaming = provider.Capabilities.SupportsStreaming,
             tools = provider.Capabilities.SupportsTools,
         }));
@@ -57,12 +63,16 @@ public static class HttpHost
 
         app.MapGet("/v1/sessions/{id}", (string id) =>
         {
+            try { FileSessionStore.ValidateSessionId(id); }
+            catch (ArgumentException) { return Results.BadRequest(new { error = "invalid_session_id", id }); }
             try { return Results.Json(SessionView(store.Get(id))); }
             catch (KeyNotFoundException) { return Results.NotFound(new { error = "session_not_found", id }); }
         });
 
         app.MapGet("/v1/sessions/{id}/messages", (string id) =>
         {
+            try { FileSessionStore.ValidateSessionId(id); }
+            catch (ArgumentException) { return Results.BadRequest(new { error = "invalid_session_id", id }); }
             try
             {
                 var s = store.Get(id);
@@ -77,12 +87,16 @@ public static class HttpHost
 
         app.MapGet("/v1/sessions/{id}/runs", (string id) =>
         {
+            try { FileSessionStore.ValidateSessionId(id); }
+            catch (ArgumentException) { return Results.BadRequest(new { error = "invalid_session_id", id }); }
             try { return Results.Json(store.Get(id).Runs); }
             catch (KeyNotFoundException) { return Results.NotFound(new { error = "session_not_found", id }); }
         });
 
         app.MapPost("/v1/sessions/{id}/runs", async (HttpContext ctx, string id, RunCreateBody body) =>
         {
+            try { FileSessionStore.ValidateSessionId(id); }
+            catch (ArgumentException) { ctx.Response.StatusCode = 400; await ctx.Response.WriteAsJsonAsync(new { error = "invalid_session_id", id }); return; }
             try { _ = store.Get(id); }
             catch (KeyNotFoundException) { ctx.Response.StatusCode = 404; await ctx.Response.WriteAsJsonAsync(new { error = "session_not_found", id }); return; }
 
@@ -97,14 +111,15 @@ public static class HttpHost
                 || string.Equals(ctx.Request.Query["stream"], "true", StringComparison.OrdinalIgnoreCase);
 
             var executor = new TurnExecutor(store, provider, body.Model ?? config.Model);
-            var runIdHolder = new List<string>();
+            string? runId = null;
 
             if (!wantsSse)
             {
                 // Blocking JSON mode.
                 try
                 {
-                    var result = await executor.ExecuteAsync(id, body.Prompt, body.Model, null, ctx.RequestAborted);
+                    var result = await executor.ExecuteAsync(id, body.Prompt, body.Model, null, ctx.RequestAborted,
+                        onRunStarted: r => { runId = r.Id; return Task.CompletedTask; });
                     ctx.Response.ContentType = "application/json";
                     await ctx.Response.WriteAsJsonAsync(new
                     {
@@ -114,8 +129,8 @@ public static class HttpHost
                 }
                 catch (ProviderException pex)
                 {
-                    ctx.Response.StatusCode = pex.Code == ProviderErrorCodes.Auth ? 502 : 502;
-                    await ctx.Response.WriteAsJsonAsync(new { error = pex.Code, message = pex.Message, retryable = pex.Retryable });
+                    ctx.Response.StatusCode = MapProviderErrorToStatus(pex);
+                    await ctx.Response.WriteAsJsonAsync(new { error = pex.Code, message = pex.Message, retryable = pex.Retryable, runId, sessionId = id });
                 }
                 return;
             }
@@ -132,17 +147,13 @@ public static class HttpHost
                 seq++;
             }
 
-            // Create run id early for correlation: executor creates it internally,
-            // so we announce on first delta/completion by re-reading store tail.
             try
             {
-                // Announce start with best-effort latest run after a tick; simpler: announce session first.
-                await WriteEvent("run.start", new { sessionId = id, model = body.Model ?? config.Model, seq = 0 });
-
-                var result = await executor.ExecuteAsync(id, body.Prompt, body.Model, async delta =>
-                {
-                    await WriteEvent("text.delta", new { sessionId = id, delta });
-                }, ctx.RequestAborted);
+                var result = await executor.ExecuteAsync(
+                    id, body.Prompt, body.Model,
+                    onDelta: async delta => await WriteEvent("text.delta", new { sessionId = id, runId, delta }),
+                    ct: ctx.RequestAborted,
+                    onRunStarted: async r => { runId = r.Id; await WriteEvent("run.start", new { sessionId = id, runId = r.Id, model = body.Model ?? config.Model }); });
 
                 await WriteEvent("run.completed", new
                 {
@@ -152,21 +163,30 @@ public static class HttpHost
             }
             catch (OperationCanceledException)
             {
-                try { await WriteEvent("run.failed", new { sessionId = id, error = "cancelled", message = "Client disconnected or cancelled." }); } catch { }
+                try { await WriteEvent("run.failed", new { sessionId = id, runId, error = "cancelled", message = "Client disconnected or cancelled." }); } catch { }
             }
             catch (ProviderException pex)
             {
-                try { await WriteEvent("run.failed", new { sessionId = id, error = pex.Code, message = pex.Message, retryable = pex.Retryable }); } catch { }
+                try { await WriteEvent("run.failed", new { sessionId = id, runId, error = pex.Code, message = pex.Message, retryable = pex.Retryable }); } catch { }
             }
             catch (Exception ex)
             {
-                try { await WriteEvent("run.failed", new { sessionId = id, error = "unknown", message = ex.Message }); } catch { }
+                try { await WriteEvent("run.failed", new { sessionId = id, runId, error = "unknown", message = ex.Message }); } catch { }
             }
         });
 
         Console.WriteLine($"ai-sharp serving on http://{bindHost}:{port} (provider={provider.ProviderId} model={config.Model})");
         await app.RunAsync(ct);
     }
+
+    private static int MapProviderErrorToStatus(ProviderException pex) => pex.Code switch
+    {
+        ProviderErrorCodes.RateLimited => 429,
+        ProviderErrorCodes.BadRequest => 400,
+        ProviderErrorCodes.ModelUnavailable => 400,
+        ProviderErrorCodes.Cancelled => 408,
+        _ => 502, // auth (server-side secret), upstream server, timeouts, unknown
+    };
 
     private static object SessionView(SessionRecord s) => new
     {

@@ -31,7 +31,9 @@ data/
 *.local.json
 appsettings.local.json
 .ai-sharp.key
+opencode-go.key
 .opencode-go.key
+credentials.json
 credentials.local.json
 
 # OS
