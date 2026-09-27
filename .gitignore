@@ -26,6 +26,14 @@
 *.snupkg
 artifacts/
 
+# Local secrets — never commit provider keys.
+data/
+*.local.json
+appsettings.local.json
+.ai-sharp.key
+.opencode-go.key
+credentials.local.json
+
 # OS
 .DS_Store
 Thumbs.db
