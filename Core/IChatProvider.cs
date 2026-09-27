@@ -10,6 +10,10 @@ public abstract record ProviderStreamEvent;
 
 public sealed record TextDeltaEvent(string Delta) : ProviderStreamEvent;
 
+/// <summary>A completed model request for a local tool call. The engine authorizes,
+/// executes, and feeds the result back; provider IDs are preserved for the echo.</summary>
+public sealed record ToolCallEvent(ToolCallRequest Call) : ProviderStreamEvent;
+
 public sealed record CompletedEvent(
     string FullText,
     ProviderUsage Usage,
@@ -18,12 +22,16 @@ public sealed record CompletedEvent(
 /// <summary>
 /// Request passed to a provider adapter. SessionId is used for gateways
 /// that need a stable conversation id (OpenCode Go: x-opencode-session).
+/// Tools, when non-empty, are offered as function tools with tool_choice=auto.
 /// </summary>
 public sealed record ProviderRequest(
     string Model,
     IReadOnlyList<ChatMessage> Messages,
     string? SessionId,
-    CancellationToken CancellationToken);
+    CancellationToken CancellationToken,
+    IReadOnlyList<ToolDefinition>? Tools = null,
+    IReadOnlyList<object>? ExtraInput = null,
+    IReadOnlyList<object>? FullInput = null);
 
 public sealed record ProviderResult(
     string Text,

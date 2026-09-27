@@ -27,7 +27,9 @@ internal sealed record ResponsesRequest(
     [property: JsonPropertyName("model")] string Model,
     [property: JsonPropertyName("input")] List<object> Input,
     [property: JsonPropertyName("stream")] bool Stream,
-    [property: JsonPropertyName("store")] bool Store);
+    [property: JsonPropertyName("store")] bool Store,
+    [property: JsonPropertyName("tools")] List<object>? Tools = null,
+    [property: JsonPropertyName("tool_choice")] string? ToolChoice = null);
 
 internal sealed class ResponsesResponse
 {

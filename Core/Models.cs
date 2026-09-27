@@ -31,7 +31,14 @@ public sealed record StoredMessage(
     string Text,
     DateTimeOffset CreatedAt,
     string? ProviderResponseId = null,
-    ProviderUsage? Usage = null);
+    ProviderUsage? Usage = null,
+    string? RunId = null);
+
+public sealed record StoredRunEvent(
+    int Seq,
+    string Name,
+    string DataJson,
+    DateTimeOffset CreatedAt);
 
 public sealed record StoredRun(
     string Id,
@@ -44,7 +51,9 @@ public sealed record StoredRun(
     string? ErrorMessage,
     string? ProviderResponseId,
     DateTimeOffset CreatedAt,
-    DateTimeOffset? CompletedAt);
+    DateTimeOffset? CompletedAt,
+    List<StoredRunEvent> Events = null!,
+    int ToolRounds = 0);
 
 public static class RunStatuses
 {
@@ -61,11 +70,19 @@ public sealed record SessionRecord(
     DateTimeOffset UpdatedAt,
     string? Title,
     List<StoredMessage> Messages,
-    List<StoredRun> Runs);
+    List<StoredRun> Runs,
+    List<StoredToolCall> ToolCalls = null!,
+    Dictionary<string, string> RequestKeys = null!);
 
 public static class Ids
 {
     public static string NewSessionId() => "sess_" + Guid.NewGuid().ToString("N")[..12];
     public static string NewRunId() => "run_" + Guid.NewGuid().ToString("N")[..12];
     public static string NewMessageId() => "msg_" + Guid.NewGuid().ToString("N")[..12];
+}
+
+/// <summary>Thrown under the turn lock when a client request key already owns a run.</summary>
+public sealed class DuplicateRunException(string runId) : Exception($"Duplicate request: run {runId} already exists.")
+{
+    public string RunId { get; } = runId;
 }

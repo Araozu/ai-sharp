@@ -4,7 +4,19 @@ AI# is a planned C# service for the intrinsic work of an AI assistant: talking t
 
 The long-term direction is a distributed control plane. This repository starts with the AI engine that such a control plane could use. The first target is one durable, single-node service.
 
-> **Current status:** planning and a .NET 11 console starter. `Program.cs` currently prints `Hello, World!`; there is no server, provider integration, or agent runtime yet.
+> **Current status:** Phases 1–3 implemented. OpenCode Go provider (`muse-spark-1.3-contributor`) with streaming text, an owned `calc`/`time_now` tool loop, durable sessions/runs/tool-calls/event replay, and an HTTP+SSE API. See `ai-sharp --help`.
+
+## Repository today
+
+One `net11.0` project, no external package dependencies. The API key is read from `OPENCODE_GO_API_KEY` or `~/.config/ai-sharp/opencode-go.key` (never logged); transcripts persist under `./data` (or `AI_SHARP_DATA_DIR`).
+
+```sh
+dotnet build
+./bin/Debug/net11.0/ai-sharp doctor     # validate config, credential, store, provider
+./bin/Debug/net11.0/ai-sharp selftest   # offline engine tests
+./bin/Debug/net11.0/ai-sharp chat -m "What is 12*13? Use calc."
+./bin/Debug/net11.0/ai-sharp serve --port 5111
+```
 
 ## What the service will own
 
@@ -28,14 +40,15 @@ A shallow clone of OpenCode is available at `~/projects/opencode` for local refe
 
 ## Repository today
 
-The repository currently has one `net11.0` console project and no external package dependencies. To run the starter, install an SDK that supports `net11.0`, then use:
+One `net11.0` project, no external package dependencies. The API key is read from `OPENCODE_GO_API_KEY` or `~/.config/ai-sharp/opencode-go.key` (never logged); transcripts persist under `./data` (or `AI_SHARP_DATA_DIR`).
 
 ```sh
 dotnet build
-dotnet run
+./bin/Debug/net11.0/ai-sharp doctor     # validate config, credential, store, provider
+./bin/Debug/net11.0/ai-sharp selftest   # offline engine tests
+./bin/Debug/net11.0/ai-sharp chat -m "What is 12*13? Use calc."
+./bin/Debug/net11.0/ai-sharp serve --port 5111
 ```
-
-These commands only build and run the placeholder app for now.
 
 ## Planning docs
 

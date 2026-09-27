@@ -14,11 +14,18 @@ public interface ISessionStore
     IReadOnlyList<SessionRecord> List();
     SessionRecord Get(string sessionId);
     void Save(SessionRecord session);
-    StoredMessage AppendMessage(string sessionId, string role, string text, string? providerResponseId = null, ProviderUsage? usage = null);
+    StoredMessage AppendMessage(string sessionId, string role, string text, string? providerResponseId = null, ProviderUsage? usage = null, string? runId = null);
     StoredRun CreateRun(string sessionId, string prompt);
-    void FinishRun(string sessionId, string runId, string status, string? responseText, ProviderUsage? usage, string? errorCode, string? errorMessage, string? providerResponseId);
+    void FinishRun(string sessionId, string runId, string status, string? responseText, ProviderUsage? usage, string? errorCode, string? errorMessage, string? providerResponseId, int toolRounds = 0);
     /// <summary>Mark runs left non-terminal by a crash as failed. Returns the count reconciled.</summary>
     int ReconcileInterruptedRuns();
+    StoredToolCall CreateToolCall(string sessionId, string runId, string name, string argumentsJson, string? providerCallId = null, string? providerItemId = null);    void FinishToolCall(string sessionId, string toolCallId, string status, string? resultText, string? error);
+    /// <summary>Append a run event; returns its run-scoped sequence number. Oldest text deltas stop persisting past the cap.</summary>
+    int AppendRunEvent(string sessionId, string runId, string name, string dataJson);
+    IReadOnlyList<StoredRunEvent> GetRunEvents(string sessionId, string runId, int afterSeq = -1);
+    /// <summary>Idempotency index: client request key -&gt; run id, scoped to a session.</summary>
+    bool TryGetRequestKey(string sessionId, string clientRequestId, out string runId);
+    void SetRequestKey(string sessionId, string clientRequestId, string runId);
 }
 
 /// <summary>
@@ -74,7 +81,7 @@ public sealed class FileSessionStore : ISessionStore
     public SessionRecord Create(string? title = null)
     {
         var now = DateTimeOffset.UtcNow;
-        var s = new SessionRecord(Ids.NewSessionId(), now, now, title, [], []);
+        var s = new SessionRecord(Ids.NewSessionId(), now, now, title, [], [], [], new());
         Save(s);
         return s;
     }
@@ -113,12 +120,12 @@ public sealed class FileSessionStore : ISessionStore
         }
     }
 
-    public StoredMessage AppendMessage(string sessionId, string role, string text, string? providerResponseId = null, ProviderUsage? usage = null)
+    public StoredMessage AppendMessage(string sessionId, string role, string text, string? providerResponseId = null, ProviderUsage? usage = null, string? runId = null)
     {
         lock (_gate)
         {
             var s = Get_NoLock(sessionId);
-            var m = new StoredMessage(Ids.NewMessageId(), role, text, DateTimeOffset.UtcNow, providerResponseId, usage);
+            var m = new StoredMessage(Ids.NewMessageId(), role, text, DateTimeOffset.UtcNow, providerResponseId, usage, runId);
             s.Messages.Add(m);
             WriteFile(PathFor(s.Id), s with { UpdatedAt = DateTimeOffset.UtcNow });
             return m;
@@ -131,14 +138,14 @@ public sealed class FileSessionStore : ISessionStore
         {
             var s = Get_NoLock(sessionId);
             var now = DateTimeOffset.UtcNow;
-            var run = new StoredRun(Ids.NewRunId(), sessionId, RunStatuses.Running, prompt, null, null, null, null, null, now, null);
+            var run = new StoredRun(Ids.NewRunId(), sessionId, RunStatuses.Running, prompt, null, null, null, null, null, now, null, []);
             s.Runs.Add(run);
             WriteFile(PathFor(s.Id), s with { UpdatedAt = now });
             return run;
         }
     }
 
-    public void FinishRun(string sessionId, string runId, string status, string? responseText, ProviderUsage? usage, string? errorCode, string? errorMessage, string? providerResponseId)
+    public void FinishRun(string sessionId, string runId, string status, string? responseText, ProviderUsage? usage, string? errorCode, string? errorMessage, string? providerResponseId, int toolRounds = 0)
     {
         lock (_gate)
         {
@@ -154,6 +161,7 @@ public sealed class FileSessionStore : ISessionStore
                 ErrorCode = errorCode,
                 ErrorMessage = errorMessage,
                 ProviderResponseId = providerResponseId,
+                ToolRounds = toolRounds,
                 CompletedAt = DateTimeOffset.UtcNow
             };
             WriteFile(PathFor(s.Id), s with { UpdatedAt = DateTimeOffset.UtcNow });
@@ -177,8 +185,15 @@ public sealed class FileSessionStore : ISessionStore
     private static SessionRecord ReadFile(string path)
     {
         var json = File.ReadAllText(path);
-        var rec = JsonSerializer.Deserialize<SessionRecord>(json, JsonOpts);
-        return rec ?? throw new InvalidDataException($"Empty session file: {path}");
+        var rec = JsonSerializer.Deserialize<SessionRecord>(json, JsonOpts)
+            ?? throw new InvalidDataException($"Empty session file: {path}");
+        // Migrate older files (new nullable collections).
+        return rec with
+        {
+            ToolCalls = rec.ToolCalls ?? [],
+            RequestKeys = rec.RequestKeys ?? [],
+            Runs = rec.Runs.Select(r => r with { Events = r.Events ?? [] }).ToList(),
+        };
     }
 
     private static void WriteFile(string path, SessionRecord session)
@@ -196,12 +211,100 @@ public sealed class FileSessionStore : ISessionStore
         }
     }
 
-    public int ReconcileInterruptedRuns()
+    public int AppendRunEvent(string sessionId, string runId, string name, string dataJson)
     {
         lock (_gate)
         {
-            var count = 0;
-            foreach (var file in Directory.GetFiles(_sessionsDir, "*.json"))
+            var s = Get_NoLock(sessionId);
+            var idx = s.Runs.FindIndex(r => r.Id == runId);
+            if (idx < 0) throw new KeyNotFoundException($"Run not found: {runId}");
+            var run = s.Runs[idx];
+            // Normalized non-null by Create/ReadFile; lists are mutated in place.
+            // Cap: stop persisting (not streaming) text deltas past 5000 events.
+            // Dropped deltas return -1 so transports never issue a replayable id for them.
+            if (run.Events.Count >= MaxRunEvents && name == "text.delta")
+                return -1;
+            var seq = run.Events.Count;
+            run.Events.Add(new StoredRunEvent(seq, name, dataJson, DateTimeOffset.UtcNow));
+            WriteFile(PathFor(s.Id), s with { UpdatedAt = DateTimeOffset.UtcNow });
+            return seq;
+        }
+    }
+
+    public IReadOnlyList<StoredRunEvent> GetRunEvents(string sessionId, string runId, int afterSeq = -1)
+    {
+        lock (_gate)
+        {
+            var s = Get_NoLock(sessionId);
+            var run = s.Runs.FirstOrDefault(r => r.Id == runId)
+                ?? throw new KeyNotFoundException($"Run not found: {runId}");
+            return run.Events.Where(e => e.Seq > afterSeq).ToList();
+        }
+    }
+
+    public StoredToolCall CreateToolCall(string sessionId, string runId, string name, string argumentsJson, string? providerCallId = null, string? providerItemId = null)
+    {
+        lock (_gate)
+        {
+            var s = Get_NoLock(sessionId);
+            var tc = new StoredToolCall(ToolIds.New(), sessionId, runId, name, argumentsJson,
+                ToolStatuses.Running, null, null, DateTimeOffset.UtcNow, null, providerCallId, providerItemId);
+            s.ToolCalls.Add(tc);
+            WriteFile(PathFor(s.Id), s with { UpdatedAt = DateTimeOffset.UtcNow });
+            return tc;
+        }
+    }
+
+    public void FinishToolCall(string sessionId, string toolCallId, string status, string? resultText, string? error)
+    {
+        lock (_gate)
+        {
+            var s = Get_NoLock(sessionId);
+            var idx = s.ToolCalls.FindIndex(t => t.Id == toolCallId);
+            if (idx < 0) throw new KeyNotFoundException($"Tool call not found: {toolCallId}");
+            var old = s.ToolCalls[idx];
+            s.ToolCalls[idx] = old with
+            {
+                Status = status, ResultText = resultText, Error = error, CompletedAt = DateTimeOffset.UtcNow,
+            };
+            WriteFile(PathFor(s.Id), s with { UpdatedAt = DateTimeOffset.UtcNow });
+        }
+    }
+
+    public bool TryGetRequestKey(string sessionId, string clientRequestId, out string runId)
+    {
+        lock (_gate)
+        {
+            var s = Get_NoLock(sessionId);
+            return s.RequestKeys.TryGetValue(clientRequestId, out runId!);
+        }
+    }
+
+    public void SetRequestKey(string sessionId, string clientRequestId, string runId)
+    {
+        lock (_gate)
+        {
+            var s = Get_NoLock(sessionId);
+            s.RequestKeys[clientRequestId] = runId;
+            WriteFile(PathFor(s.Id), s with { UpdatedAt = DateTimeOffset.UtcNow });
+        }
+    }
+
+    private const int MaxRunEvents = 5000;
+
+    public int ReconcileInterruptedRuns()
+    {
+        var count = 0;
+        foreach (var file in Directory.GetFiles(_sessionsDir, "*.json"))
+        {
+            var id = Path.GetFileNameWithoutExtension(file);
+            // Only touch sessions whose owner is gone: a live turn holds this lock.
+            // A CLI racing the server skips the session instead of killing its run.
+            FileStream? sessionLock = null;
+            try { sessionLock = SessionLockFile.Acquire(_sessionsDir, id, TimeSpan.Zero, CancellationToken.None); }
+            catch (IOException) { continue; }
+            using (sessionLock)
+            lock (_gate)
             {
                 SessionRecord s;
                 try { s = ReadFile(file); }
@@ -224,8 +327,25 @@ public sealed class FileSessionStore : ISessionStore
                     }
                 }
                 if (dirty) WriteFile(file, s with { UpdatedAt = DateTimeOffset.UtcNow });
+                var tdirty = false;
+                for (var i = 0; i < s.ToolCalls.Count; i++)
+                {
+                    var t = s.ToolCalls[i];
+                    if (t.Status is ToolStatuses.Running or ToolStatuses.Pending)
+                    {
+                        s.ToolCalls[i] = t with
+                        {
+                            Status = ToolStatuses.Failed,
+                            Error = "Process ended before the tool finished; last durable state preserved.",
+                            CompletedAt = DateTimeOffset.UtcNow,
+                        };
+                        count++;
+                        tdirty = true;
+                    }
+                }
+                if (tdirty) WriteFile(file, s with { UpdatedAt = DateTimeOffset.UtcNow });
             }
-            return count;
         }
+        return count;
     }
 }

@@ -20,7 +20,11 @@ internal static class Program
                 "serve" => await ServeAsync(args[1..]),
                 "chat" => await ChatAsync(args[1..]),
                 "sessions" => Sessions(args[1..]),
+                "runs" => Runs(args[1..]),
+                "tools" => Tools(args[1..]),
                 "models" => await ModelsAsync(),
+                "doctor" => await DoctorAsync(),
+                "selftest" => await SelfTest.RunAsync(),
                 "key" => KeyCmd(args[1..]),
                 _ => PrintHelp(),
             };
@@ -47,7 +51,11 @@ internal static class Program
               ai-sharp serve [--port 5111]                 Start HTTP+SSE host (loopback only by default)
               ai-sharp chat -m "prompt" [--session ID] [--model ID] [--no-stream]
               ai-sharp sessions create [--title T] | list | show ID
+              ai-sharp runs events SESSION RUN [--after N]  Replay persisted run events
+              ai-sharp tools list                          List registered local tools
               ai-sharp models                                List provider models (GET /models; protocol annotated)
+              ai-sharp doctor                                Validate config, credential, store, provider reachability
+              ai-sharp selftest                              Offline engine tests (tools, cancel, concurrency, recovery)
               ai-sharp key save [-]                          Save key from hidden prompt, stdin (-) or KEY arg (arg stays in shell history)
               ai-sharp key status                            Show credential location (never prints key)
 
@@ -70,6 +78,9 @@ internal static class Program
             Directory.CreateDirectory(Path.Combine(dataDir, "sessions"));
         }
         var cfg = AiSharpConfig.Default(dataDir);
+        var problems = cfg.Validate();
+        if (problems.Count > 0)
+            throw new InvalidOperationException("Invalid configuration:\n- " + string.Join("\n- ", problems));
         var store = new FileSessionStore(dataDir);
         var reconciled = store.ReconcileInterruptedRuns();
         if (reconciled > 0)
@@ -145,11 +156,18 @@ internal static class Program
 
         var executor = new TurnExecutor(store, provider, model ?? cfg.Model);
         Console.WriteLine($"model: {model ?? cfg.Model}  provider: opencode-go");
+        Task OnEvent(string name, int seq, string dataJson)
+        {
+            if (name is "tool.call.request" or "tool.result")
+                Console.WriteLine($"\n[{name}] {Truncate(dataJson, 220)}");
+            return Task.CompletedTask;
+        }
         if (noStream)
         {
-            var result = await executor.ExecuteAsync(sessionId, message, model);
+            var result = await executor.ExecuteAsync(sessionId, message, model, null, CancellationToken.None, null, OnEvent);
             Console.WriteLine(result.Text);
             PrintUsage(result.Usage);
+            PrintTools(result.ToolCalls);
         }
         else
         {
@@ -157,9 +175,10 @@ internal static class Program
             {
                 Console.Write(delta);
                 return Task.CompletedTask;
-            });
+            }, CancellationToken.None, null, OnEvent);
             Console.WriteLine();
             PrintUsage(result.Usage);
+            PrintTools(result.ToolCalls);
         }
         Console.WriteLine($"session: {sessionId} (transcript persisted under {cfg.DataDir})");
         return 0;
@@ -208,6 +227,86 @@ internal static class Program
                 Console.Error.WriteLine("Usage: ai-sharp sessions create|list|show ID");
                 return 1;
         }
+    }
+
+    private static int Tools(string[] args)
+    {
+        var sub = args.Length > 0 ? args[0].ToLowerInvariant() : "list";
+        if (sub != "list") { Console.Error.WriteLine("Usage: ai-sharp tools list"); return 1; }
+        var reg = ToolRegistry.WithBuiltins();
+        foreach (var d in reg.Definitions())
+            Console.WriteLine($"{d.Name}\t{d.Description}\n  schema: {d.ParametersJson}");
+        Console.WriteLine($"policy: registered safe tools run automatically; unknown tools are denied.");
+        return 0;
+    }
+
+    private static int Runs(string[] args)
+    {
+        if (args.Length >= 1 && args[0].ToLowerInvariant() == "events")
+        {
+            if (args.Length < 3) { Console.Error.WriteLine("Usage: ai-sharp runs events SESSION RUN [--after N]"); return 1; }
+            var (_, store) = BootConfig();
+            var after = -1;
+            for (var i = 3; i < args.Length; i++)
+                if (args[i] == "--after")
+                {
+                    var v = TakeValue(args, ref i, "--after");
+                    if (v is null || !int.TryParse(v, out after)) { Console.Error.WriteLine("Invalid --after value."); return 1; }
+                }
+            foreach (var e in store.GetRunEvents(args[1], args[2], after))
+                Console.WriteLine($"[{e.Seq} {e.Name}] {Truncate(e.DataJson, 400)}");
+            return 0;
+        }
+        Console.Error.WriteLine("Usage: ai-sharp runs events SESSION RUN [--after N]");
+        return 1;
+    }
+
+    private static async Task<int> DoctorAsync()
+    {
+        var failures = 0;
+        void Line(bool ok, string msg)
+        {
+            Console.WriteLine($"{(ok ? "ok  " : "FAIL")} {msg}");
+            if (!ok) failures++;
+        }
+        var dataDir = Environment.GetEnvironmentVariable("AI_SHARP_DATA_DIR")
+            ?? Path.Combine(Directory.GetCurrentDirectory(), "data");
+        var cfg = AiSharpConfig.Default(dataDir);
+        var problems = cfg.Validate();
+        Line(problems.Count == 0, problems.Count == 0
+            ? $"config valid (model={cfg.Model} base={cfg.BaseUrl})"
+            : "config: " + string.Join("; ", problems));
+        var proto = OpencodeGoProvider.ProtocolFor(cfg.Model);
+        Line(proto == "responses", proto == "responses"
+            ? $"model protocol: responses"
+            : $"model '{cfg.Model}' uses {proto}; Phase 1 adapter speaks responses only");
+        try { CredentialStore.ResolveApiKey(); Line(true, "credential present (never printed)"); }
+        catch (Exception ex) { Line(false, "credential: " + ex.Message); }
+        try
+        {
+            var probe = new FileSessionStore(dataDir);
+            var n = probe.ReconcileInterruptedRuns();
+            Line(true, $"store writable at {dataDir} (reconciled {n} interrupted)");
+        }
+        catch (Exception ex) { Line(false, "store: " + ex.Message); }
+        var reg = ToolRegistry.WithBuiltins();
+        Line(true, $"tools: {string.Join(", ", reg.Definitions().Select(d => d.Name))} (auto-approved safe built-ins)");
+        if (failures == 0)
+        {
+            try
+            {
+                var provider = BootProvider(cfg);
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+                var models = await provider.ListModelsAsync(cts.Token);
+                Line(models.Contains(cfg.Model), $"provider reachable: {models.Count} models; default {(models.Contains(cfg.Model) ? "listed" : "NOT listed")}");
+            }
+            catch (Exception ex) { Line(false, "provider: " + ex.Message); }
+        }
+        else
+        {
+            Console.WriteLine("skip  provider reachability (fix failures above first)");
+        }
+        return failures == 0 ? 0 : 1;
     }
 
     private static async Task<int> ModelsAsync()
@@ -269,6 +368,12 @@ internal static class Program
     {
         if (u is null) return;
         Console.WriteLine($"[usage in={u.InputTokens} out={u.OutputTokens} total={u.TotalTokens} cached={u.CachedInputTokens?.ToString() ?? "-"} reasoning={u.ReasoningOutputTokens?.ToString() ?? "-"}]");
+    }
+
+    private static void PrintTools(IReadOnlyList<StoredToolCall> tools)
+    {
+        foreach (var t in tools)
+            Console.WriteLine($"[tool {t.Name} {t.Status}] {Truncate(t.ResultText ?? t.Error ?? "", 200)}");
     }
 
     private static string Truncate(string s, int n) => s.Length <= n ? s : s[..n] + "…";

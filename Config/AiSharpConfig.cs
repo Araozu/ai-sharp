@@ -19,6 +19,38 @@ public sealed record AiSharpConfig(
             ?? "ai-sharp/0.1",
         DataDir: dataDir,
         DefaultPort: int.TryParse(Environment.GetEnvironmentVariable("AI_SHARP_PORT"), out var p) ? p : 5111);
+
+    /// <summary>Fail-fast configuration validation. Returns human-actionable problems (empty = ok).</summary>
+    public List<string> Validate()
+    {
+        var problems = new List<string>();
+        if (!Uri.TryCreate(BaseUrl, UriKind.Absolute, out var uri)
+            || (uri.Scheme != "https" && uri.Scheme != "http"))
+            problems.Add($"OPENCODE_GO_BASE_URL '{BaseUrl}' is not an absolute http(s) URL.");
+        else if (uri.Scheme == "http" && !IsLoopback(uri.Host))
+            problems.Add($"OPENCODE_GO_BASE_URL '{BaseUrl}' uses plain http to a non-loopback host; credentials would travel unencrypted. Use https.");
+        if (string.IsNullOrWhiteSpace(Model))
+            problems.Add("Model is empty (OPENCODE_GO_MODEL). Set e.g. muse-spark-1.3-contributor.");
+        if (string.IsNullOrWhiteSpace(UserAgent) || UserAgent.Contains("dotnet", StringComparison.OrdinalIgnoreCase))
+            problems.Add("User-Agent must be a product identifier like ai-sharp/0.1 (OpenCode Go requires non-generic agents).");
+        if (DefaultPort is < 1 or > 65535)
+            problems.Add($"Port {DefaultPort} is out of range (AI_SHARP_PORT).");
+        try
+        {
+            var probe = Path.Combine(DataDir, "sessions", ".write-probe");
+            Directory.CreateDirectory(Path.GetDirectoryName(probe)!);
+            File.WriteAllText(probe, "ok");
+            File.Delete(probe);
+        }
+        catch (Exception ex)
+        {
+            problems.Add($"Data dir '{DataDir}' is not writable: {ex.Message}");
+        }
+        return problems;
+    }
+
+    private static bool IsLoopback(string host) =>
+        host is "localhost" or "::1" || System.Net.IPAddress.TryParse(host, out var ip) && System.Net.IPAddress.IsLoopback(ip);
 }
 
 /// <summary>
